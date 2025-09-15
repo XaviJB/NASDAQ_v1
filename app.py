@@ -283,6 +283,7 @@ if run_btn:
             return data[(tk, field)]
 
     rows = []
+    move_col_name = f"pct_days_|ret|>={vol_day_move:.2f}%"
     for tk in base_symbols:
         try:
             close = get_series(tk, "Close")
@@ -306,7 +307,7 @@ if run_btn:
                 "market_cap": base.loc[tk, "market_cap"],
                 "employees": base.loc[tk, "employees"],
                 "avg_dollar_vol_63d": avg_dollar_vol,
-                "pct_days_|ret|>={}%".format(vol_day_move): vol_ratio,
+                {move_col_name}: vol_ratio,
                 "trend_ok": pass_trend
             })
         except Exception:
@@ -315,7 +316,18 @@ if run_btn:
     out = pd.DataFrame(rows)
 
     # Filtros finales
-    out = out[(out["avg_dollar_vol_63d"] >= min_avg_dollar_vol) & (out["pct_days_|ret|>={}%".format(vol_day_move)] >= vol_day_ratio)]
+    if out.empty:
+        st.warning("No se calcularon métricas para ningún símbolo (datos de precios insuficientes o tickers sin volumen). Prueba a bajar filtros o ampliar universo/periodo.")
+        st.stop()
+
+    required_cols = ["avg_dollar_vol_63d", move_col_name]
+    missing = [c for c in required_cols if c not in out.columns]
+    if missing:
+        st.warning(f"Faltan columnas requeridas {missing}. Puede deberse a falta de datos. Muestra preliminar abajo.")
+        st.dataframe(out)
+        st.stop()
+
+    out = out[(out["avg_dollar_vol_63d"] >= min_avg_dollar_vol) & (out[move_col_name] >= vol_day_ratio)]
 
     if trend_mode != "Cualquiera":
         out = out[out["trend_ok"] == True]
