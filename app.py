@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 
 # Fallback de datos (Stooq) si Yahoo falla
-t ry:
+try:
     import pandas_datareader.data as pdr
     HAVE_PDR = True
 except Exception:
