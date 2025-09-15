@@ -16,6 +16,13 @@ import streamlit as st
 from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 
+# Fallback de datos (Stooq) si Yahoo falla
+t ry:
+    import pandas_datareader.data as pdr
+    HAVE_PDR = True
+except Exception:
+    HAVE_PDR = False
+
 st.set_page_config(page_title="Screener NASDAQ + S&P500", layout="wide")
 
 # -----------------------------
@@ -265,29 +272,50 @@ if run_btn:
         base = base[(base["market_cap"] >= min_mcap_input) & (base["employees"] >= min_employees)]
     base_symbols = base.index.tolist()
 
-    st.write(f"Símbolos tras mcap/empleados: {len(base_symbols)}")
+    # Limpieza de tickers problemáticos (warrants, units, rights, etc.) del NASDAQ
+    bad_suffixes = ("W", "U", "R")
+    base_symbols = [s for s in base_symbols if s.isalpha() and not s.endswith(bad_suffixes)]
+
+    st.write(f"Símbolos tras mcap/empleados (y limpieza): {len(base_symbols)}")
 
     if len(base_symbols) == 0:
         st.warning("Ningún símbolo supera mcap/empleados con los parámetros actuales.")
         st.stop()
 
     # Precios
-    with st.spinner("Descargando precios (yfinance, 1y diario)... puede tardar"):
-        data = get_prices(base_symbols, period="1y")
-
-    # Estructura de yfinance cambia si hay un solo ticker
-    def get_series(tk, field):
-        if len(base_symbols) == 1:
-            return data[field]
-        else:
-            return data[(tk, field)]
+    with st.spinner("Descargando precios (yfinance, 1y diario, secuencial)..."):
+        pass
 
     rows = []
     move_col_name = f"pct_days_|ret|>={vol_day_move:.2f}%"
     for tk in base_symbols:
         try:
-            close = get_series(tk, "Close")
-            volume = get_series(tk, "Volume")
+            df = None
+            # Intento Yahoo Finance (hasta 3 reintentos)
+            for _ in range(3):
+                try:
+                    df = yf.download(tk, period="1y", interval="1d", auto_adjust=False, progress=False, threads=False)
+                    if df is not None and not df.empty:
+                        break
+                except Exception:
+                    time.sleep(0.3)
+            # Fallback Stooq (si está disponible)
+            if (df is None or df.empty) and 'HAVE_PDR' in globals() and HAVE_PDR:
+                try:
+                    end = datetime.today()
+                    start = end - timedelta(days=365)
+                    df = pdr.DataReader(f"{tk}.US", "stooq", start, end)
+                    if df is not None and not df.empty:
+                        df = df.sort_index()
+                except Exception:
+                    df = None
+
+            if df is None or df.empty:
+                continue
+
+            close = df["Close"]
+            volume = df["Volume"] if "Volume" in df.columns else pd.Series(index=close.index, data=np.nan)
+
             if close.isna().all() or volume.isna().all():
                 continue
 
@@ -307,7 +335,7 @@ if run_btn:
                 "market_cap": base.loc[tk, "market_cap"],
                 "employees": base.loc[tk, "employees"],
                 "avg_dollar_vol_63d": avg_dollar_vol,
-                {move_col_name}: vol_ratio,
+                move_col_name: vol_ratio,
                 "trend_ok": pass_trend
             })
         except Exception:
