@@ -73,7 +73,7 @@ trend_mode = st.sidebar.selectbox(
 
 universe_opt = st.sidebar.multiselect(
     "Universo de índices",
-    ["S&P 500 (^GSPC)", "NASDAQ Composite (^IXIC)"],
+    ["S&P 500 (^GSPC)", "NASDAQ Composite (^IXIC)", "NASDAQ-100 (^NDX)"],
     default=["S&P 500 (^GSPC)", "NASDAQ Composite (^IXIC)"]
 )
 
@@ -93,6 +93,7 @@ if FINNHUB_API_KEY:
     headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
 
 PUBLIC_WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+PUBLIC_WIKI_NDX = "https://en.wikipedia.org/wiki/Nasdaq-100"
 PUBLIC_NASDAQ_LIST = "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 
 @st.cache_data(show_spinner=False)
@@ -138,6 +139,22 @@ def get_nasdaq_public() -> list:
             if sym and test_flag != "Y":
                 out.append(sym)
         return out
+    except Exception:
+        return []
+
+@st.cache_data(show_spinner=False)
+def get_ndx_public() -> list:
+    """NASDAQ-100 desde Wikipedia (gratis)."""
+    try:
+        tables = pd.read_html(PUBLIC_WIKI_NDX)
+        for df in tables:
+            cols = [str(c).lower() for c in df.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col_idx = [i for i, c in enumerate(cols) if ("ticker" in c or "symbol" in c)][0]
+                syms = df.iloc[:, col_idx].astype(str).str.strip().str.replace(".", "-", regex=False)
+                syms = [s for s in syms if s and s != "nan"]
+                return syms
+        return []
     except Exception:
         return []
 
@@ -238,7 +255,11 @@ if run_btn:
                     targets.extend(spx)
             if "NASDAQ Composite (^IXIC)" in universe_opt:
                 with st.spinner("Descargando componentes NASDAQ Composite (Finnhub)..."):
-                    ndx = get_index_constituents("^IXIC")
+                    ixic = get_index_constituents("^IXIC")
+                    targets.extend(ixic)
+            if "NASDAQ-100 (^NDX)" in universe_opt:
+                with st.spinner("Descargando componentes NASDAQ-100 (Finnhub)..."):
+                    ndx = get_index_constituents("^NDX")
                     targets.extend(ndx)
         else:
             if "S&P 500 (^GSPC)" in universe_opt:
@@ -247,6 +268,9 @@ if run_btn:
             if "NASDAQ Composite (^IXIC)" in universe_opt:
                 with st.spinner("Descargando Nasdaq (NasdaqTrader)..."):
                     targets.extend(get_nasdaq_public())
+            if "NASDAQ-100 (^NDX)" in universe_opt:
+                with st.spinner("Descargando NASDAQ-100 (Wikipedia)..."):
+                    targets.extend(get_ndx_public())
     except requests.HTTPError as e:
         st.error("Finnhub devolvió HTTPError en /index/constituents (probable bloqueo de plan). Cambia a modo Gratis en la barra lateral o usa ^NDX (Nasdaq-100).")
         st.stop()
@@ -285,7 +309,7 @@ if run_btn:
 
     # Limpieza de tickers problemáticos (warrants, units, rights, etc.) del NASDAQ
     bad_suffixes = ("W", "U", "R")
-    base_symbols = [s for s in base_symbols if s.isalpha() and not s.endswith(bad_suffixes)]
+    base_symbols = [s for s in base_symbols if isinstance(s, str) and len(s) > 0 and not any(s.endswith(suf) for suf in bad_suffixes)]
 
     st.write(f"Símbolos tras mcap/empleados (y limpieza): {len(base_symbols)}")
 
@@ -302,29 +326,33 @@ if run_btn:
     for tk in base_symbols:
         try:
             df = None
-            # Intento Yahoo Finance (hasta 3 reintentos)
-            for _ in range(3):
-                try:
-                    df = yf.download(tk, period="1y", interval="1d", auto_adjust=False, progress=False, threads=False)
-                    if df is not None and not df.empty:
-                        break
-                except Exception:
-                    time.sleep(0.3)
-            # Fallback Stooq (si está disponible)
-            if (df is None or df.empty) and 'HAVE_PDR' in globals() and HAVE_PDR:
-                try:
-                    end = datetime.today()
-                    start = end - timedelta(days=365)
-                    df = pdr.DataReader(f"{tk}.US", "stooq", start, end)
-                    if df is not None and not df.empty:
-                        df = df.sort_index()
-                except Exception:
-                    df = None
+            # 1) Stooq primero (más estable en Cloud): prueba sin sufijo y con .US
+            if 'HAVE_PDR' in globals() and HAVE_PDR:
+                end = datetime.today()
+                start = end - timedelta(days=365*2)
+                for sym_try in (tk, f"{tk}.US"):
+                    try:
+                        df = pdr.DataReader(sym_try, "stooq", start, end)
+                        if df is not None and not df.empty:
+                            df = df.sort_index()
+                            break
+                    except Exception:
+                        df = None
+            # 2) Yahoo como fallback
+            if df is None or df.empty:
+                for _ in range(2):
+                    try:
+                        df = yf.download(tk, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
+                        if df is not None and not df.empty:
+                            break
+                    except Exception:
+                        time.sleep(0.3)
 
             if df is None or df.empty:
                 continue
 
-            close = df["Close"]
+            # Columnas
+            close = df["Close"] if "Close" in df.columns else df.iloc[:, 3]
             volume = df["Volume"] if "Volume" in df.columns else pd.Series(index=close.index, data=np.nan)
 
             if close.isna().all() or volume.isna().all():
