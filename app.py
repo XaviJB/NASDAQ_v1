@@ -257,13 +257,24 @@ if run_btn:
 
     st.write(f"Total símbolos a procesar: {len(symbols)}")
 
+    if len(symbols) == 0:
+        st.error("No se han obtenido componentes. Revisa 'Universo de índices' o cambia de fuente (Gratis/Finnhub).")
+        st.stop()
+
     # Perfiles (mcap / empleados)
     with st.spinner("Descargando fundamentales (market cap, empleados)..."):
-        if FINNHUB_API_KEY:
+        prof = None
+        if FINNHUB_API_KEY and len(symbols) > 0:
             prof = get_profiles_bulk(symbols)
-        else:
-            st.warning("Sin FINNHUB_API_KEY no se pueden obtener market cap/empleados. Se omitirán esos filtros.")
-            prof = pd.DataFrame({"symbol": symbols, "name": [None]*len(symbols), "market_cap": [np.nan]*len(symbols), "employees": [np.nan]*len(symbols)}).set_index("symbol")
+        if prof is None or prof.empty or ("symbol" not in prof.columns):
+            if FINNHUB_API_KEY:
+                st.warning("Perfiles vacíos o sin 'symbol'; usando fallback sin mcap/empleados.")
+            prof = pd.DataFrame({
+                "symbol": symbols,
+                "name": [None]*len(symbols),
+                "market_cap": [np.nan]*len(symbols),
+                "employees": [np.nan]*len(symbols)
+            })
         prof = prof.drop_duplicates(subset=["symbol"]).set_index("symbol")
 
     # Pre-filtrado por mcap y empleados (si hay datos)
