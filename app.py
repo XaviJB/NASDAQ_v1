@@ -1,413 +1,170 @@
-# Screener NASDAQ Composite + S&P 500 — Streamlit
-# Autor: ChatGPT (para Xavi)
-# Requisitos: pip install streamlit yfinance pandas numpy requests scikit-learn
-# Uso: streamlit run app.py
+# app.py — Finnhub minimal (test NASDAQ)
+# Cómo usar en Streamlit Cloud:
+# 1) Añade este archivo como app.py en tu repo
+# 2) Crea requirements.txt (contenido en el chat)
+# 3) En Settings → Secrets añade: FINNHUB_API_KEY = tu_clave
+# 4) Deploy
 
-import os
-import io
 import time
-import json
 import math
+import json
 import requests
-import numpy as np
 import pandas as pd
-import yfinance as yf
 import streamlit as st
 from datetime import datetime, timedelta
-from sklearn.linear_model import LinearRegression
 
-# Fallback de datos (Stooq) si Yahoo falla
-try:
-    import pandas_datareader.data as pdr
-    HAVE_PDR = True
-except Exception:
-    HAVE_PDR = False
+st.set_page_config(page_title="Finnhub · Test NASDAQ", layout="wide")
 
-st.set_page_config(page_title="Screener NASDAQ + S&P500", layout="wide")
+# ---------------- Sidebar ----------------
+st.sidebar.header("Conexión")
+api_key = st.sidebar.text_input("Finnhub API Key", type="password")
+if not api_key:
+    api_key = st.secrets.get("FINNHUB_API_KEY", "")
+base_url = "https://finnhub.io/api/v1"
+headers = {"X-Finnhub-Token": api_key} if api_key else None
 
-# -----------------------------
-# Sidebar — Parámetros
-# -----------------------------
-st.sidebar.header("Parámetros del filtro")
-source_mode = st.sidebar.selectbox(
-    "Fuente de componentes del índice",
-    [
-        "Finnhub (requiere acceso al endpoint de índices)",
-        "Gratis: SP500 (Wikipedia/yfinance) + Nasdaq (NasdaqTrader)"
-    ],
-    help="El plan gratuito de Finnhub suele bloquear /index/constituents. Usa el modo Gratis si te da HTTPError."
-)
-FINNHUB_API_KEY = st.sidebar.text_input("Finnhub API Key (requerida)", type="password")
-# También admite Secrets en Streamlit Cloud si dejas el campo vacío
-if not FINNHUB_API_KEY:
-    FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
+st.sidebar.header("Parámetros")
+symbol = st.sidebar.text_input("Ticker (NASDAQ)", value="AAPL").strip().upper()
+period_days = st.sidebar.slider("Días de histórico (velas D)", min_value=60, max_value=730, value=365, step=5)
+run = st.sidebar.button("▶ Cargar")
 
-min_mcap_input = st.sidebar.number_input(
-    "Capitalización mínima (USD)", value=1_500_000_000, min_value=0, step=50_000_000,
-    help="Por defecto 1,5B. Si querías 1,5M, pon 1500000."
-)
+st.title("Finnhub · Test de conexión y datos de un NASDAQ ticker")
+st.caption("Muestra perfil, cotización, métricas y velas diarias. Sirve como base para futuros filtros.")
 
-min_employees = st.sidebar.number_input("Empleados mínimos", value=150, min_value=0, step=50)
+# ------------- Utils -------------
 
-min_avg_dollar_vol = st.sidebar.number_input(
-    "Volumen medio 3 meses (USD por día)", value=800_000, min_value=0, step=50_000,
-    help="Media de (Close*Volume) últimos ~63 días hábiles."
-)
-
-vol_window = st.sidebar.slider("Ventana volatilidad (días hábiles)", 40, 126, 63)
-vol_day_move = st.sidebar.number_input("Umbral movimiento diario (%)", value=2.5, min_value=0.0, step=0.1)
-vol_day_ratio = st.sidebar.slider("% de días que deben superar el umbral", 10, 100, 40)
-
-trend_mode = st.sidebar.selectbox(
-    "Filtro de tendencia",
-    [
-        "Cualquiera",
-        "Lateral-alcista (suave)",
-        "Alcista tras caída brusca (>=10%)"
-    ],
-    help=(
-        "Lateral-alcista: pendiente positiva suave en 90d y 20DMA cerca de 50DMA (±5%).\n"
-        "Post-caída: drawdown >=10% en 60d y recuperación > +5% desde el mínimo."
-    )
-)
-
-universe_opt = st.sidebar.multiselect(
-    "Universo de índices",
-    ["S&P 500 (^GSPC)", "NASDAQ Composite (^IXIC)", "NASDAQ-100 (^NDX)"],
-    default=["S&P 500 (^GSPC)", "NASDAQ Composite (^IXIC)"]
-)
-
-limit_tickers = st.sidebar.number_input(
-    "Límite máximo de símbolos a procesar (para pruebas)", value=0, min_value=0,
-    help="0 = sin límite. El NASDAQ Composite tiene miles de valores; limita si tu equipo es modesto."
-)
-
-run_btn = st.sidebar.button("▶ Ejecutar screener")
-
-# -----------------------------
-# Utilidades
-# -----------------------------
-FINNHUB_BASE = "https://finnhub.io/api/v1"
-headers = None
-if FINNHUB_API_KEY:
-    headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
-
-PUBLIC_WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-PUBLIC_WIKI_NDX = "https://en.wikipedia.org/wiki/Nasdaq-100"
-PUBLIC_NASDAQ_LIST = "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-
-@st.cache_data(show_spinner=False)
-def get_index_constituents(symbol: str) -> list:
-    """Obtiene los componentes de un índice desde Finnhub (p.ej. ^GSPC, ^NDX). Requiere endpoint habilitado."""
-    url = f"{FINNHUB_BASE}/index/constituents"
-    r = requests.get(url, params={"symbol": symbol}, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    syms = data.get("constituents") or []
-    return [s for s in syms if isinstance(s, str) and len(s) > 0]
-
-@st.cache_data(show_spinner=False)
-def get_sp500_public() -> list:
-    """SP500 desde yfinance / Wikipedia (gratis)."""
+def fh_get(path: str, params: dict):
+    if not api_key:
+        st.error("Falta API key de Finnhub.")
+        st.stop()
+    url = f"{base_url}/{path}"
     try:
-        syms = yf.tickers_sp500()
-        if syms: return syms
-    except Exception:
-        pass
-    try:
-        tables = pd.read_html(PUBLIC_WIKI_SP500)
-        df = tables[0]
-        col = [c for c in df.columns if str(c).lower().startswith("symbol")][0]
-        return df[col].astype(str).str.replace(".", "-", regex=False).tolist()
-    except Exception:
-        return []
-
-@st.cache_data(show_spinner=False)
-def get_nasdaq_public() -> list:
-    """Nasdaq Composite aproximado vía lista oficial de NasdaqTrader (gratis)."""
-    try:
-        r = requests.get(PUBLIC_NASDAQ_LIST, timeout=30)
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code == 429:
+            st.error("Finnhub 429 (rate limit). Espera un momento y reintenta.")
+            st.stop()
         r.raise_for_status()
-        lines = r.text.strip().splitlines()
-        out = []
-        for ln in lines[1:]:
-            parts = ln.split("|")
-            if len(parts) < 5:
-                continue
-            sym = parts[0].strip()
-            test_flag = parts[-2].strip()  # Test Issue (Y/N)
-            if sym and test_flag != "Y":
-                out.append(sym)
-        return out
-    except Exception:
-        return []
-
-@st.cache_data(show_spinner=False)
-def get_ndx_public() -> list:
-    """NASDAQ-100 desde Wikipedia (gratis)."""
-    try:
-        tables = pd.read_html(PUBLIC_WIKI_NDX)
-        for df in tables:
-            cols = [str(c).lower() for c in df.columns]
-            if any("ticker" in c or "symbol" in c for c in cols):
-                col_idx = [i for i, c in enumerate(cols) if ("ticker" in c or "symbol" in c)][0]
-                syms = df.iloc[:, col_idx].astype(str).str.strip().str.replace(".", "-", regex=False)
-                syms = [s for s in syms if s and s != "nan"]
-                return syms
-        return []
-    except Exception:
-        return []
-
-@st.cache_data(show_spinner=False)
-def get_profiles_bulk(symbols: list) -> pd.DataFrame:
-    """Descarga perfil básico (market cap, empleados) con Finnhub."""
-    rows = []
-    for s in symbols:
-        try:
-            url = f"{FINNHUB_BASE}/stock/profile2"
-            r = requests.get(url, params={"symbol": s}, headers=headers, timeout=15)
-            if r.status_code != 200:
-                continue
-            j = r.json() or {}
-            rows.append({
-                "symbol": s,
-                "name": j.get("name"),
-                "market_cap": j.get("marketCapitalization"),
-                "employees": j.get("employeeTotal"),
-                "exchange": j.get("exchange"),
-                "ticker": j.get("ticker"),
-                "ipo": j.get("ipo"),
-                "country": j.get("country")
-            })
-        except Exception:
-            continue
-        time.sleep(0.05)  # ser amables con la API
-    return pd.DataFrame(rows)
-
-@st.cache_data(show_spinner=False)
-def get_prices(symbols: list, period="1y") -> pd.DataFrame:
-    """Descarga OHLCV diario de yfinance (multi-index columns)."""
-    data = yf.download(symbols, period=period, interval="1d", auto_adjust=False, progress=False, group_by="ticker")
-    return data
-
-def compute_dollar_vol(df_close: pd.Series, df_vol: pd.Series, window: int = 63) -> float:
-    x = (df_close * df_vol).dropna()
-    if len(x) == 0:
-        return np.nan
-    return float(x.tail(window).mean())
-
-def ratio_large_moves(df_close: pd.Series, window: int, pct: float) -> float:
-    ret = df_close.pct_change().abs().dropna()
-    if len(ret) == 0:
-        return 0.0
-    w = ret.tail(window)
-    return 100.0 * (w >= (pct/100.0)).mean()
-
-def lr_slope(series: pd.Series) -> float:
-    y = series.dropna().values.reshape(-1, 1)
-    if len(y) < 10:
-        return np.nan
-    X = np.arange(len(y)).reshape(-1, 1)
-    model = LinearRegression().fit(X, y)
-    return float(model.coef_[0])
-
-def lateral_up_filter(close: pd.Series) -> bool:
-    c = close.dropna()
-    if len(c) < 100:
-        return False
-    sma20 = c.rolling(20).mean()
-    sma50 = c.rolling(50).mean()
-    cond_band = (abs(sma20.iloc[-1] - sma50.iloc[-1]) / sma50.iloc[-1]) <= 0.05  # ±5%
-    slope90 = lr_slope(c.tail(90))
-    return bool(cond_band and slope90 > 0)
-
-def post_drop_filter(close: pd.Series) -> bool:
-    c = close.dropna()
-    if len(c) < 70:
-        return False
-    # drawdown >=10% en ventana de 60d (mínimo frente a máximo previo cercano)
-    last60 = c.tail(60)
-    peak = last60.expanding().max()
-    dd = (last60/peak - 1.0)
-    if (dd.min() <= -0.10):
-        trough_idx = dd.idxmin()
-        trough_price = last60.loc[trough_idx]
-        # recuperación > +5% desde el mínimo
-        return bool(last60.iloc[-1] >= trough_price * 1.05)
-    return False
-
-# -----------------------------
-# Ejecución
-# -----------------------------
-st.title("Screener NASDAQ Composite + S&P 500")
-st.caption("Filtros: mcap, empleados, volumen $ 3m, volatilidad diaria y patrón de tendencia.")
-
-if run_btn:
-    targets = []
-    try:
-        if source_mode.startswith("Finnhub"):
-            if not FINNHUB_API_KEY:
-                st.error("Falta FINNHUB_API_KEY. Cambia a modo Gratis o añade tu clave en Secrets.")
-                st.stop()
-            if "S&P 500 (^GSPC)" in universe_opt:
-                with st.spinner("Descargando componentes S&P 500 (Finnhub)..."):
-                    spx = get_index_constituents("^GSPC")
-                    targets.extend(spx)
-            if "NASDAQ Composite (^IXIC)" in universe_opt:
-                with st.spinner("Descargando componentes NASDAQ Composite (Finnhub)..."):
-                    ixic = get_index_constituents("^IXIC")
-                    targets.extend(ixic)
-            if "NASDAQ-100 (^NDX)" in universe_opt:
-                with st.spinner("Descargando componentes NASDAQ-100 (Finnhub)..."):
-                    ndx = get_index_constituents("^NDX")
-                    targets.extend(ndx)
-        else:
-            if "S&P 500 (^GSPC)" in universe_opt:
-                with st.spinner("Descargando SP500 (Wikipedia/yfinance)..."):
-                    targets.extend(get_sp500_public())
-            if "NASDAQ Composite (^IXIC)" in universe_opt:
-                with st.spinner("Descargando Nasdaq (NasdaqTrader)..."):
-                    targets.extend(get_nasdaq_public())
-            if "NASDAQ-100 (^NDX)" in universe_opt:
-                with st.spinner("Descargando NASDAQ-100 (Wikipedia)..."):
-                    targets.extend(get_ndx_public())
+        return r.json()
     except requests.HTTPError as e:
-        st.error("Finnhub devolvió HTTPError en /index/constituents (probable bloqueo de plan). Cambia a modo Gratis en la barra lateral o usa ^NDX (Nasdaq-100).")
+        # Muestra mensaje corto con código
+        st.error(f"HTTPError {r.status_code} en {path}: {r.text[:200]}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Error en petición {path}: {e}")
         st.stop()
 
-    symbols = sorted(list({t for t in targets}))
-    if limit_tickers and limit_tickers > 0:
-        symbols = symbols[:int(limit_tickers)]
+@st.cache_data(show_spinner=False)
+def fetch_all(symbol: str, period_days: int):
+    out = {}
+    # Perfil de la empresa
+    out["profile2"] = fh_get("stock/profile2", {"symbol": symbol})
+    # Cotización actual
+    out["quote"] = fh_get("quote", {"symbol": symbol})
+    # Métricas (puede estar limitado en plan free)
+    try:
+        out["metric_all"] = fh_get("stock/metric", {"symbol": symbol, "metric": "all"})
+    except Exception:
+        out["metric_all"] = {}
+    # Velas diarias
+    to_ts = int(datetime.utcnow().timestamp())
+    from_ts = int((datetime.utcnow() - timedelta(days=period_days)).timestamp())
+    candles = fh_get("stock/candle", {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": from_ts,
+        "to": to_ts,
+    })
+    out["candles_raw"] = candles
+    # Convertir velas a DataFrame
+    if candles and candles.get("s") == "ok":
+        df = pd.DataFrame({
+            "t": candles.get("t", []),
+            "o": candles.get("o", []),
+            "h": candles.get("h", []),
+            "l": candles.get("l", []),
+            "c": candles.get("c", []),
+            "v": candles.get("v", []),
+        })
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["t"], unit="s")
+            df = df.set_index("date").drop(columns=["t"]).sort_index()
+        out["candles_df"] = df
+    else:
+        out["candles_df"] = pd.DataFrame()
+    return out
 
-    st.write(f"Total símbolos a procesar: {len(symbols)}")
+# ------------- Run -------------
+if run:
+    st.write(f"**Ticker:** {symbol}")
+    data = fetch_all(symbol, period_days)
 
-    if len(symbols) == 0:
-        st.error("No se han obtenido componentes. Revisa 'Universo de índices' o cambia de fuente (Gratis/Finnhub).")
-        st.stop()
+    col1, col2 = st.columns([1,1])
+    with col1:
+        st.subheader("Perfil (profile2)")
+        prof = data.get("profile2", {})
+        if prof:
+            # Muestra campos clave si existen
+            campos = {
+                "name": prof.get("name"),
+                "ticker": prof.get("ticker"),
+                "exchange": prof.get("exchange"),
+                "marketCapitalization": prof.get("marketCapitalization"),
+                "employeeTotal": prof.get("employeeTotal"),
+                "ipo": prof.get("ipo"),
+                "country": prof.get("country"),
+                "finnhubIndustry": prof.get("finnhubIndustry"),
+            }
+            st.table(pd.DataFrame.from_dict(campos, orient="index", columns=["valor"]))
+        with st.expander("JSON completo (profile2)"):
+            st.json(prof)
 
-    # Perfiles (mcap / empleados)
-    with st.spinner("Descargando fundamentales (market cap, empleados)..."):
-        prof = None
-        if FINNHUB_API_KEY and len(symbols) > 0:
-            prof = get_profiles_bulk(symbols)
-        if prof is None or prof.empty or ("symbol" not in prof.columns):
-            if FINNHUB_API_KEY:
-                st.warning("Perfiles vacíos o sin 'symbol'; usando fallback sin mcap/empleados.")
-            prof = pd.DataFrame({
-                "symbol": symbols,
-                "name": [None]*len(symbols),
-                "market_cap": [np.nan]*len(symbols),
-                "employees": [np.nan]*len(symbols)
-            })
-        prof = prof.drop_duplicates(subset=["symbol"]).set_index("symbol")
+    with col2:
+        st.subheader("Cotización (quote)")
+        qt = data.get("quote", {})
+        if qt:
+            # Finnhub devuelve: c(último), d/cambio abs, dp/% cambio, h/l/o pc...
+            st.table(pd.DataFrame.from_dict(qt, orient="index", columns=["valor"]))
+        with st.expander("JSON completo (quote)"):
+            st.json(qt)
 
-    # Pre-filtrado por mcap y empleados (si hay datos)
-    base = prof.copy()
-    if prof["market_cap"].notna().any() and prof["employees"].notna().any():
-        base = base[(base["market_cap"] >= min_mcap_input) & (base["employees"] >= min_employees)]
-    base_symbols = base.index.tolist()
+    st.subheader("Métricas (stock/metric — puede estar limitado en free)")
+    met = data.get("metric_all", {}) or {}
+    if met:
+        # Keys de primer nivel: metric, metricType, series
+        # Mostramos listado de claves disponibles para que sepas qué filtrar
+        keys_lv1 = list(met.keys())
+        st.write({"claves_nivel1": keys_lv1})
+        # Si trae 'metric', lo tabulamos
+        if isinstance(met.get("metric"), dict) and met["metric"]:
+            dfm = pd.DataFrame.from_dict(met["metric"], orient="index", columns=["valor"]).sort_index()
+            st.dataframe(dfm)
+        with st.expander("JSON completo (metric)"):
+            st.json(met)
+    else:
+        st.info("Sin métricas (este endpoint puede estar restringido en el plan gratuito).")
 
-    # Limpieza de tickers problemáticos (warrants, units, rights, etc.) del NASDAQ
-    bad_suffixes = ("W", "U", "R")
-    base_symbols = [s for s in base_symbols if isinstance(s, str) and len(s) > 0 and not any(s.endswith(suf) for suf in bad_suffixes)]
-
-    st.write(f"Símbolos tras mcap/empleados (y limpieza): {len(base_symbols)}")
-
-    if len(base_symbols) == 0:
-        st.warning("Ningún símbolo supera mcap/empleados con los parámetros actuales.")
-        st.stop()
-
-    # Precios
-    with st.spinner("Descargando precios (yfinance, 1y diario, secuencial)..."):
-        pass
-
-    rows = []
-    move_col_name = f"pct_days_|ret|>={vol_day_move:.2f}%"
-    for tk in base_symbols:
+    st.subheader("Velas diarias y cálculo básico")
+    df = data.get("candles_df", pd.DataFrame())
+    if df is not None and not df.empty:
+        st.line_chart(df["c"], height=240)
+        # Cálculos básicos (para tus futuros filtros)
         try:
-            df = None
-            # 1) Stooq primero (más estable en Cloud): prueba sin sufijo y con .US
-            if 'HAVE_PDR' in globals() and HAVE_PDR:
-                end = datetime.today()
-                start = end - timedelta(days=365*2)
-                for sym_try in (tk, f"{tk}.US"):
-                    try:
-                        df = pdr.DataReader(sym_try, "stooq", start, end)
-                        if df is not None and not df.empty:
-                            df = df.sort_index()
-                            break
-                    except Exception:
-                        df = None
-            # 2) Yahoo como fallback
-            if df is None or df.empty:
-                for _ in range(2):
-                    try:
-                        df = yf.download(tk, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
-                        if df is not None and not df.empty:
-                            break
-                    except Exception:
-                        time.sleep(0.3)
-
-            if df is None or df.empty:
-                continue
-
-            # Columnas
-            close = df["Close"] if "Close" in df.columns else df.iloc[:, 3]
-            volume = df["Volume"] if "Volume" in df.columns else pd.Series(index=close.index, data=np.nan)
-
-            if close.isna().all() or volume.isna().all():
-                continue
-
-            avg_dollar_vol = compute_dollar_vol(close, volume, window=63)
-            vol_ratio = ratio_large_moves(close, window=vol_window, pct=vol_day_move)
-
-            # Tendencia
-            pass_trend = True
-            if trend_mode == "Lateral-alcista (suave)":
-                pass_trend = lateral_up_filter(close)
-            elif trend_mode == "Alcista tras caída brusca (>=10%)":
-                pass_trend = post_drop_filter(close)
-
-            rows.append({
-                "symbol": tk,
-                "name": base.loc[tk, "name"],
-                "market_cap": base.loc[tk, "market_cap"],
-                "employees": base.loc[tk, "employees"],
-                "avg_dollar_vol_63d": avg_dollar_vol,
-                move_col_name: vol_ratio,
-                "trend_ok": pass_trend
+            # Volumen en $ ~ cierre * volumen (promedio 63 sesiones)
+            df["dollar_vol"] = df["c"] * df["v"].fillna(0)
+            avg_dollar_vol_63d = float(df["dollar_vol"].tail(63).mean()) if len(df) >= 10 else float("nan")
+            # % de días con |ret| >= 2.5% (últimos 63)
+            ret = df["c"].pct_change().abs()
+            ratio_25 = 100.0 * (ret.tail(63) >= 0.025).mean()
+            st.write({
+                "avg_dollar_vol_63d": avg_dollar_vol_63d,
+                "pct_days_|ret|>=2.5% (63d)": ratio_25,
+                "n_rows": len(df)
             })
-        except Exception:
-            continue
-
-    out = pd.DataFrame(rows)
-
-    # Filtros finales
-    if out.empty:
-        st.warning("No se calcularon métricas para ningún símbolo (datos de precios insuficientes o tickers sin volumen). Prueba a bajar filtros o ampliar universo/periodo.")
-        st.stop()
-
-    required_cols = ["avg_dollar_vol_63d", move_col_name]
-    missing = [c for c in required_cols if c not in out.columns]
-    if missing:
-        st.warning(f"Faltan columnas requeridas {missing}. Puede deberse a falta de datos. Muestra preliminar abajo.")
-        st.dataframe(out)
-        st.stop()
-
-    out = out[(out["avg_dollar_vol_63d"] >= min_avg_dollar_vol) & (out[move_col_name] >= vol_day_ratio)]
-
-    if trend_mode != "Cualquiera":
-        out = out[out["trend_ok"] == True]
-
-    out = out.sort_values(["trend_ok", "avg_dollar_vol_63d"], ascending=[False, False])
-
-    st.subheader("Resultados")
-    st.write(f"Candidatos: {len(out)}")
-    st.dataframe(out.reset_index(drop=True))
-
-    csv = out.to_csv(index=False).encode("utf-8")
-    st.download_button("Descargar CSV", data=csv, file_name="screener_resultados.csv", mime="text/csv")
-
-    st.caption("Nota: este screener es heurístico. Valida siempre con tu propia diligencia.")
+        except Exception as e:
+            st.warning(f"No se pudieron calcular métricas básicas: {e}")
+        with st.expander("DataFrame velas (head)"):
+            st.dataframe(df.head())
+    else:
+        st.warning("Finnhub devolvió sin velas (candles). Prueba con otro símbolo o aumenta el rango de días.")
 else:
-    st.info("Introduce tu API key de Finnhub, ajusta parámetros y pulsa 'Ejecutar screener'.")
+    st.info("Introduce tu FINNHUB_API_KEY, el símbolo (ej. AAPL) y pulsa 'Cargar'.")
