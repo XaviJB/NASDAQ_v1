@@ -22,7 +22,18 @@ st.set_page_config(page_title="Screener NASDAQ + S&P500", layout="wide")
 # Sidebar — Parámetros
 # -----------------------------
 st.sidebar.header("Parámetros del filtro")
+source_mode = st.sidebar.selectbox(
+    "Fuente de componentes del índice",
+    [
+        "Finnhub (requiere acceso al endpoint de índices)",
+        "Gratis: SP500 (Wikipedia/yfinance) + Nasdaq (NasdaqTrader)"
+    ],
+    help="El plan gratuito de Finnhub suele bloquear /index/constituents. Usa el modo Gratis si te da HTTPError."
+)
 FINNHUB_API_KEY = st.sidebar.text_input("Finnhub API Key (requerida)", type="password")
+# También admite Secrets en Streamlit Cloud si dejas el campo vacío
+if not FINNHUB_API_KEY:
+    FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 
 min_mcap_input = st.sidebar.number_input(
     "Capitalización mínima (USD)", value=1_500_000_000, min_value=0, step=50_000_000,
@@ -74,16 +85,54 @@ headers = None
 if FINNHUB_API_KEY:
     headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
 
+PUBLIC_WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+PUBLIC_NASDAQ_LIST = "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+
 @st.cache_data(show_spinner=False)
 def get_index_constituents(symbol: str) -> list:
-    """Obtiene los componentes de un índice desde Finnhub (p.ej. ^GSPC, ^IXIC)."""
+    """Obtiene los componentes de un índice desde Finnhub (p.ej. ^GSPC, ^NDX). Requiere endpoint habilitado."""
     url = f"{FINNHUB_BASE}/index/constituents"
     r = requests.get(url, params={"symbol": symbol}, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
     syms = data.get("constituents") or []
-    # Finnhub suele devolver tickers US sin sufijos. Filtramos entradas raras.
     return [s for s in syms if isinstance(s, str) and len(s) > 0]
+
+@st.cache_data(show_spinner=False)
+def get_sp500_public() -> list:
+    """SP500 desde yfinance / Wikipedia (gratis)."""
+    try:
+        syms = yf.tickers_sp500()
+        if syms: return syms
+    except Exception:
+        pass
+    try:
+        tables = pd.read_html(PUBLIC_WIKI_SP500)
+        df = tables[0]
+        col = [c for c in df.columns if str(c).lower().startswith("symbol")][0]
+        return df[col].astype(str).str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        return []
+
+@st.cache_data(show_spinner=False)
+def get_nasdaq_public() -> list:
+    """Nasdaq Composite aproximado vía lista oficial de NasdaqTrader (gratis)."""
+    try:
+        r = requests.get(PUBLIC_NASDAQ_LIST, timeout=30)
+        r.raise_for_status()
+        lines = r.text.strip().splitlines()
+        out = []
+        for ln in lines[1:]:
+            parts = ln.split("|")
+            if len(parts) < 5:
+                continue
+            sym = parts[0].strip()
+            test_flag = parts[-2].strip()  # Test Issue (Y/N)
+            if sym and test_flag != "Y":
+                out.append(sym)
+        return out
+    except Exception:
+        return []
 
 @st.cache_data(show_spinner=False)
 def get_profiles_bulk(symbols: list) -> pd.DataFrame:
@@ -170,19 +219,30 @@ st.title("Screener NASDAQ Composite + S&P 500")
 st.caption("Filtros: mcap, empleados, volumen $ 3m, volatilidad diaria y patrón de tendencia.")
 
 if run_btn:
-    if not FINNHUB_API_KEY:
-        st.error("Debes introducir tu Finnhub API Key para obtener componentes y fundamentales.")
-        st.stop()
-
     targets = []
-    if "S&P 500 (^GSPC)" in universe_opt:
-        with st.spinner("Descargando componentes S&P 500..."):
-            spx = get_index_constituents("^GSPC")
-            targets.extend(spx)
-    if "NASDAQ Composite (^IXIC)" in universe_opt:
-        with st.spinner("Descargando componentes NASDAQ Composite..."):
-            ndx = get_index_constituents("^IXIC")
-            targets.extend(ndx)
+    try:
+        if source_mode.startswith("Finnhub"):
+            if not FINNHUB_API_KEY:
+                st.error("Falta FINNHUB_API_KEY. Cambia a modo Gratis o añade tu clave en Secrets.")
+                st.stop()
+            if "S&P 500 (^GSPC)" in universe_opt:
+                with st.spinner("Descargando componentes S&P 500 (Finnhub)..."):
+                    spx = get_index_constituents("^GSPC")
+                    targets.extend(spx)
+            if "NASDAQ Composite (^IXIC)" in universe_opt:
+                with st.spinner("Descargando componentes NASDAQ Composite (Finnhub)..."):
+                    ndx = get_index_constituents("^IXIC")
+                    targets.extend(ndx)
+        else:
+            if "S&P 500 (^GSPC)" in universe_opt:
+                with st.spinner("Descargando SP500 (Wikipedia/yfinance)..."):
+                    targets.extend(get_sp500_public())
+            if "NASDAQ Composite (^IXIC)" in universe_opt:
+                with st.spinner("Descargando Nasdaq (NasdaqTrader)..."):
+                    targets.extend(get_nasdaq_public())
+    except requests.HTTPError as e:
+        st.error("Finnhub devolvió HTTPError en /index/constituents (probable bloqueo de plan). Cambia a modo Gratis en la barra lateral o usa ^NDX (Nasdaq-100).")
+        st.stop()
 
     symbols = sorted(list({t for t in targets}))
     if limit_tickers and limit_tickers > 0:
@@ -192,12 +252,17 @@ if run_btn:
 
     # Perfiles (mcap / empleados)
     with st.spinner("Descargando fundamentales (market cap, empleados)..."):
-        prof = get_profiles_bulk(symbols)
+        if FINNHUB_API_KEY:
+            prof = get_profiles_bulk(symbols)
+        else:
+            st.warning("Sin FINNHUB_API_KEY no se pueden obtener market cap/empleados. Se omitirán esos filtros.")
+            prof = pd.DataFrame({"symbol": symbols, "name": [None]*len(symbols), "market_cap": [np.nan]*len(symbols), "employees": [np.nan]*len(symbols)}).set_index("symbol")
         prof = prof.drop_duplicates(subset=["symbol"]).set_index("symbol")
 
-    # Pre-filtrado por mcap y empleados
+    # Pre-filtrado por mcap y empleados (si hay datos)
     base = prof.copy()
-    base = base[(base["market_cap"] >= min_mcap_input) & (base["employees"] >= min_employees)]
+    if prof["market_cap"].notna().any() and prof["employees"].notna().any():
+        base = base[(base["market_cap"] >= min_mcap_input) & (base["employees"] >= min_employees)]
     base_symbols = base.index.tolist()
 
     st.write(f"Símbolos tras mcap/empleados: {len(base_symbols)}")
