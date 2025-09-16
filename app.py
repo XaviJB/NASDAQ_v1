@@ -1,8 +1,8 @@
 diff --git a/app.py b/app.py
-index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7aeb147dbdf 100644
+index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..8d8d0d8af5bbe5f90b32861b08e016e03ed6d030 100644
 --- a/app.py
 +++ b/app.py
-@@ -1,9 +1,495 @@
+@@ -1,9 +1,760 @@
 +"""Stock screener for Nasdaq Composite and S&P 500 using Finnhub data.
 +
 +This module implements a command line utility that retrieves the
@@ -24,6 +24,7 @@ index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7ae
 +import argparse
 +import logging
 +import os
++import sys
 +from dataclasses import dataclass
 +from datetime import datetime, timedelta
 +from pathlib import Path
@@ -429,19 +430,18 @@ index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7ae
 +    return parser.parse_args()
 +
 +
-+def run_screening(args: argparse.Namespace) -> pd.DataFrame:
-+    configure_logging(verbose=args.verbose)
-+    client = get_client()
-+    screener = IndexScreener(client, throttle=args.throttle)
++def execute_screening(
++    config: ScreeningConfig,
++    *,
++    throttle: float = 0.0,
++    limit: Optional[int] = None,
++    client: Optional[finnhub.Client] = None,
++) -> pd.DataFrame:
++    """Run the screening workflow and return the resulting DataFrame."""
 +
-+    config = ScreeningConfig(
-+        market_cap_min=args.min_market_cap,
-+        avg_dollar_volume_min=args.min_dollar_volume,
-+        employees_min=args.min_employees,
-+        volatility_threshold=args.volatility_threshold,
-+        volatility_share_min=args.volatility_share,
-+        lookback_months=args.lookback_months,
-+    )
++    if client is None:
++        client = get_client()
++    screener = IndexScreener(client, throttle=throttle)
 +
 +    tickers = screener.fetch_constituents(INDEX_SYMBOLS.values())
 +    results: List[Dict[str, float]] = []
@@ -450,7 +450,7 @@ index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7ae
 +        record = screener.screen_symbol(symbol, config)
 +        if record:
 +            results.append(record)
-+        if args.limit and idx >= args.limit:
++        if limit and idx >= limit:
 +            break
 +
 +    frame = pd.DataFrame(results)
@@ -474,6 +474,268 @@ index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7ae
 +    return frame
 +
 +
++def run_screening(args: argparse.Namespace) -> pd.DataFrame:
++    configure_logging(verbose=args.verbose)
++
++    config = ScreeningConfig(
++        market_cap_min=args.min_market_cap,
++        avg_dollar_volume_min=args.min_dollar_volume,
++        employees_min=args.min_employees,
++        volatility_threshold=args.volatility_threshold,
++        volatility_share_min=args.volatility_share,
++        lookback_months=args.lookback_months,
++    )
++
++    frame = execute_screening(
++        config,
++        throttle=args.throttle,
++        limit=args.limit,
++    )
++    return frame
++
++
++def _is_running_in_streamlit() -> bool:
++    """Return ``True`` when executed from ``streamlit run``."""
++
++    if os.environ.get("STREAMLIT_RUNTIME"):
++        return True
++    if os.environ.get("STREAMLIT_SERVER_RUNNING"):
++        return True
++    if "streamlit" in sys.modules:
++        return True
++    return any(
++        arg.startswith("--server.") or arg.startswith("--browser.")
++        for arg in sys.argv[1:]
++    )
++
++
++def run_streamlit_app() -> None:
++    """Render the screener with a Streamlit interface."""
++
++    import streamlit as st
++
++    st.set_page_config(page_title="Nasdaq & S&P 500 Screener", layout="wide")
++    st.title("Screener Nasdaq Composite y S&P 500")
++    st.write(
++        "Ajusta los filtros para localizar valores del Nasdaq Composite y del "
++        "S&P 500 que cumplan los requisitos de capitalización, liquidez y "
++        "volatilidad solicitados."
++    )
++
++    default_config = ScreeningConfig()
++
++    with st.sidebar:
++        st.header("Filtros")
++        st.caption(
++            "Recuerda definir la variable de entorno `FINNHUB_API_KEY` con tu "
++            "clave personal de Finnhub antes de ejecutar la aplicación."
++        )
++
++        market_cap_min_musd = st.number_input(
++            "Capitalización mínima (millones USD)",
++            min_value=0.0,
++            value=default_config.market_cap_min / 1_000_000,
++            step=10.0,
++            help=(
++                "Filtra compañías con una capitalización de mercado superior al "
++                "valor indicado."
++            ),
++        )
++        avg_dollar_volume_min_musd = st.number_input(
++            "Volumen medio diario (millones USD)",
++            min_value=0.0,
++            value=default_config.avg_dollar_volume_min / 1_000_000,
++            step=0.5,
++            format="%.2f",
++            help=(
++                "Promedio del volumen diario negociado en dólares durante la "
++                "ventana de análisis."
++            ),
++        )
++        employees_min = st.number_input(
++            "Número mínimo de empleados",
++            min_value=0,
++            value=default_config.employees_min,
++            step=10,
++        )
++        volatility_threshold_pct = st.slider(
++            "Movimiento mínimo para considerar un día volátil",
++            min_value=0.5,
++            max_value=10.0,
++            value=default_config.volatility_threshold * 100,
++            step=0.5,
++            format="%.1f%%",
++            help=(
++                "Porcentaje de variación diaria absoluta utilizado como umbral "
++                "de volatilidad."
++            ),
++        )
++        volatility_share_pct = st.slider(
++            "Porcentaje mínimo de días volátiles",
++            min_value=0.0,
++            max_value=100.0,
++            value=default_config.volatility_share_min * 100,
++            step=5.0,
++            format="%.0f%%",
++            help=(
++                "Porcentaje de días con movimientos superiores al umbral "
++                "durante el periodo analizado."
++            ),
++        )
++        lookback_months = st.slider(
++            "Meses a analizar",
++            min_value=1,
++            max_value=12,
++            value=default_config.lookback_months,
++            help="Cantidad de meses de datos diarios a solicitar.",
++        )
++        throttle = st.slider(
++            "Pausa entre peticiones (segundos)",
++            min_value=0.0,
++            max_value=2.0,
++            value=0.0,
++            step=0.1,
++            help=(
++                "Añade una espera entre peticiones para respetar los límites de "
++                "la API."
++            ),
++        )
++        limit = st.number_input(
++            "Limitar símbolos analizados (0 = sin límite)",
++            min_value=0,
++            max_value=5000,
++            value=0,
++            step=10,
++            help=(
++                "Reduce el número de tickers evaluados, útil para pruebas o "
++                "cuando te acerques al límite de peticiones."
++            ),
++        )
++        run_clicked = st.button("Ejecutar screener", type="primary")
++
++    limit_value = int(limit) if limit else None
++    config_kwargs = {
++        "market_cap_min": market_cap_min_musd * 1_000_000,
++        "avg_dollar_volume_min": avg_dollar_volume_min_musd * 1_000_000,
++        "employees_min": int(employees_min),
++        "volatility_threshold": volatility_threshold_pct / 100.0,
++        "volatility_share_min": volatility_share_pct / 100.0,
++        "lookback_months": int(lookback_months),
++    }
++
++    @st.cache_data(show_spinner=False)
++    def _cached_screening(
++        config_items: tuple[tuple[str, float], ...],
++        throttle_value: float,
++        limit_value: Optional[int],
++    ) -> pd.DataFrame:
++        kwargs = {key: value for key, value in config_items}
++        config_obj = ScreeningConfig(**kwargs)
++        return execute_screening(
++            config_obj,
++            throttle=throttle_value,
++            limit=limit_value,
++        )
++
++    had_error = False
++    if run_clicked:
++        try:
++            with st.spinner("Descargando datos desde Finnhub..."):
++                frame = _cached_screening(
++                    tuple(sorted(config_kwargs.items())),
++                    throttle,
++                    limit_value,
++                )
++        except RuntimeError as exc:
++            had_error = True
++            st.error(str(exc))
++        except Exception as exc:  # pragma: no cover - UI-only feedback
++            LOGGER.exception("Unexpected error while running Streamlit app: %s", exc)
++            had_error = True
++            st.error(f"Se produjo un error inesperado: {exc}")
++        else:
++            st.session_state["screening_results"] = frame
++            st.session_state["screening_config"] = config_kwargs
++            st.session_state["screening_limit"] = limit_value
++
++    results = st.session_state.get("screening_results")
++    if results is None:
++        if had_error:
++            st.info("No se pudieron obtener datos con los filtros actuales.")
++        else:
++            st.info("Configura los filtros y pulsa **Ejecutar screener** para comenzar.")
++        return
++
++    frame = results
++    if frame.empty:
++        st.warning("Ningún valor cumple los criterios establecidos.")
++        return
++
++    st.success(f"Se encontraron {len(frame)} valores que cumplen los filtros actuales.")
++    if had_error:
++        st.caption("Los resultados corresponden a la última ejecución correcta.")
++
++    display_frame = frame.copy()
++    rename_map = {
++        "symbol": "Ticker",
++        "name": "Nombre",
++        "market_cap_musd": "Capitalización (M USD)",
++        "avg_dollar_volume": "Volumen medio (USD)",
++        "employees": "Empleados",
++        "volatility_share": "Días volátiles",
++        "volatility_days": "Días evaluados",
++        "trend_signal": "Tendencia",
++        "total_return_pct": "Rentabilidad total (%)",
++        "max_drawdown_pct": "Drawdown máximo (%)",
++    }
++    display_frame.rename(
++        columns={key: value for key, value in rename_map.items() if key in display_frame.columns},
++        inplace=True,
++    )
++    formatters = {}
++    if "Capitalización (M USD)" in display_frame.columns:
++        formatters["Capitalización (M USD)"] = "{:,.2f}".format
++    if "Volumen medio (USD)" in display_frame.columns:
++        formatters["Volumen medio (USD)"] = "{:,.0f}".format
++    if "Días volátiles" in display_frame.columns:
++        formatters["Días volátiles"] = "{:.1%}".format
++    if "Días evaluados" in display_frame.columns:
++        formatters["Días evaluados"] = "{:.0f}".format
++    if "Rentabilidad total (%)" in display_frame.columns:
++        formatters["Rentabilidad total (%)"] = "{:.2f}".format
++    if "Drawdown máximo (%)" in display_frame.columns:
++        formatters["Drawdown máximo (%)"] = "{:.2f}".format
++
++    st.dataframe(
++        display_frame.style.format(formatters),
++        use_container_width=True,
++    )
++
++    csv_data = frame.to_csv(index=False).encode("utf-8")
++    st.download_button(
++        "Descargar resultados en CSV",
++        data=csv_data,
++        file_name="screener_resultados.csv",
++        mime="text/csv",
++    )
++
++    config_used = st.session_state.get("screening_config", config_kwargs)
++    limit_used = st.session_state.get("screening_limit")
++    st.caption(
++        "Filtros aplicados: capitalización mínima "
++        f"{config_used['market_cap_min']/1_000_000:,.2f} M USD, volumen medio "
++        f"{config_used['avg_dollar_volume_min']/1_000_000:,.2f} M USD, al menos "
++        f"{config_used['employees_min']} empleados, {config_used['volatility_share_min']*100:.0f}% "
++        "de días volátiles con movimientos superiores a "
++        f"{config_used['volatility_threshold']*100:.1f}% en {config_used['lookback_months']} meses."
++    )
++    if limit_used:
++        st.caption(
++            "La ejecución se detuvo tras analizar "
++            f"{limit_used} símbolos por el límite configurado."
++        )
++
++
 +def main() -> None:
 +    args = parse_arguments()
 +    frame = run_screening(args)
@@ -495,5 +757,15 @@ index 0b937e8a0d9a0094ad1e9ed5284f4f2baeddc7a5..0a1d5d156f5d21f5fac34c0692aca7ae
 +        frame.to_csv(args.output, index=False)
 +        print(f"Saved {len(frame)} tickers to {args.output}")
  
+-# Setup client
+-api_key = 'd342clhr01qqt8sn7pdgd342clhr01qqt8sn7pe0'
+-finnhub_client = finnhub.Client(api_key=api_key)
+ 
+-# Example: Get quote for Apple
+-quote = finnhub_client.quote('AAPL')
+-print(quote)
 +if __name__ == "__main__":
-+    main()
++    if _is_running_in_streamlit():
++        run_streamlit_app()
++    else:
++        main()
